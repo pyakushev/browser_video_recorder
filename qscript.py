@@ -127,7 +127,7 @@ OVERLAY_JS = r"""
     const el = document.createElement("div");
     el.id = "__pw_callout";
     el.textContent = text;
-    el.style.cssText = "position:absolute;top:24px;left:50%;transform:translateX(-50%);" +
+    el.style.cssText = "position:absolute;top:100px;left:50%;transform:translateX(-50%);" +
       "width:max-content;max-width:88%;box-sizing:border-box;padding:12px 22px;" +
       "border:2px solid #000;border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,0.35);" +
       "font:16pt/1.3 Arial,Helvetica,sans-serif;text-align:center;" +
