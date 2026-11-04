@@ -67,7 +67,7 @@ def main() -> int:
             return (row.get(name) or "").strip()
 
         company = field("Company Name")
-        label = f"[{index, len(rows)}/{company or '(no name)'}]"
+        label = f"[{index}/{len(rows)}] {company or '(no name)'}"
         if not field("URL"):
             print("%s -> SKIPPED (empty URL)" % label)
             failed += 1
