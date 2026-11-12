@@ -17,7 +17,7 @@ host:8000 ──► web (uvicorn + FastAPI) ──► db (postgres:16)
 ## Quick start (service)
 
 ```bash
-cp .env.example .env              # set DB_PASSWORD (the file is git-ignored)
+cp env.example .env              # set DB_PASSWORD (the file is git-ignored)
 docker compose up --build         # web on http://localhost:8000, API docs on /docs
 ```
 
@@ -118,17 +118,6 @@ Input CSV: UTF-8, `;` delimiter, `"` qualifier, header
 
 `requirements.txt` is for local use (recorder + client + service); the Docker image installs only
 `requirements-web.txt`.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `Dockerfile`, `docker-compose.yml` | image and the two-service stack |
-| `.env.example` | template for `.env` (`DB_NAME`, `DB_USER`, `DB_PASSWORD`) |
-| `web_service.py` | FastAPI service, PostgreSQL layer |
-| `video_client.py` | `UploadVideo(...)`, `GetVideoURL(...)` |
-| `capture_video.py`, `qscript.py` | recorder |
-| `requirements-web.txt`, `requirements.txt` | service-only / full dependencies |
 
 ## Design notes
 
