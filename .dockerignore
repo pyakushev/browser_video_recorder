@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+.venv/
+__pycache__/
+*.pyc
+video/
+uploads/
+README.md
+input.csv
+capture_video.py
+qscript.py
+video_client.py
+docker-compose.yml
+Dockerfile

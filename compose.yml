@@ -1,0 +1,48 @@
+services:
+  web:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-videos}
+      DB_USER: ${DB_USER:-video_user}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-videos}
+      POSTGRES_USER: ${DB_USER:-video_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  db_data:
+  uploads:
