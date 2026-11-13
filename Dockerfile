@@ -11,11 +11,13 @@ WORKDIR /app
 COPY requirements-web.txt .
 RUN pip install -r requirements-web.txt
 
-COPY web_service.py .
 
 RUN useradd --system --no-create-home --shell /usr/sbin/nologin app \
  && mkdir -p /app/uploads \
  && chown -R app:app /app/uploads
+
+COPY web_service.py .
+
 USER app
 
 EXPOSE 8000
