@@ -1,13 +1,16 @@
 """video_client.py - client functions for the video web service (web_service.py).
 
-`requests` is imported lazily inside the functions, so the recorder runs
-without it when --server is not used.
+`UploadVideo` can send an optional zoom sidecar; `GetVideoInfo` returns the
+processing status and the processed URL.  `requests` is imported lazily inside
+the functions, so the recorder runs without it when --server is not used.
 """
 
 from __future__ import annotations
 
+import contextlib
 import mimetypes
 import os
+from typing import Any, Dict, Optional
 
 CONNECT_TIMEOUT = 10  # seconds
 READ_TIMEOUT = 300  # uploading a large video can take a while
@@ -32,16 +35,30 @@ def _error_detail(response) -> str:  # type: ignore[no-untyped-def]
         return response.text[:200]
 
 
-def UploadVideo(server_url: str, video_path: str, company_name: str) -> str:
-    """Uploads a video file to the server and returns its URL."""
+def UploadVideo(
+    server_url: str,
+    video_path: str,
+    company_name: str,
+    sidecar_path: Optional[str] = None,
+) -> str:
+    """Uploads a video file (and an optional zoom sidecar) and returns its URL."""
     import requests  # lazy import
 
     filename = os.path.basename(video_path)
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    with open(video_path, "rb") as fileobj:
+    with contextlib.ExitStack() as stack:
+        fileobj = stack.enter_context(open(video_path, "rb"))
+        files: Dict[str, Any] = {"file": (filename, fileobj, content_type)}
+        if sidecar_path:
+            sidecar_obj = stack.enter_context(open(sidecar_path, "rb"))
+            files["zoom_sidecar"] = (
+                os.path.basename(sidecar_path),
+                sidecar_obj,
+                "application/json",
+            )
         response = requests.post(
             f"{_base_url(server_url)}/upload",
-            files={"file": (filename, fileobj, content_type)},
+            files=files,
             data={"company_name": company_name},
             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
         )
@@ -55,8 +72,8 @@ def UploadVideo(server_url: str, video_path: str, company_name: str) -> str:
         raise VideoServiceError(f"unexpected upload response: {response.text[:200]!r}") from exc
 
 
-def GetVideoURL(server_url: str, company_name: str) -> str:
-    """Returns the video URL for the given company name."""
+def GetVideoInfo(server_url: str, company_name: str) -> Dict[str, Any]:
+    """Returns the full record from /get_video_url (URL, processing status, ...)."""
     import requests  # lazy import
 
     response = requests.get(
@@ -71,6 +88,17 @@ def GetVideoURL(server_url: str, company_name: str) -> str:
             f"lookup failed: HTTP {response.status_code}: {_error_detail(response)}"
         )
     try:
-        return str(response.json()["video_url"])
-    except (ValueError, KeyError) as exc:
+        data = response.json()
+    except ValueError as exc:
         raise VideoServiceError(f"unexpected lookup response: {response.text[:200]!r}") from exc
+    if not isinstance(data, dict):
+        raise VideoServiceError(f"unexpected lookup response: {response.text[:200]!r}")
+    return data
+
+
+def GetVideoURL(server_url: str, company_name: str) -> str:
+    """Returns the video URL for the given company name."""
+    try:
+        return str(GetVideoInfo(server_url, company_name)["video_url"])
+    except KeyError as exc:
+        raise VideoServiceError(f"lookup response has no video_url: {exc}") from exc

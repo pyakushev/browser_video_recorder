@@ -14,3 +14,7 @@ qscript.py
 video_client.py
 docker-compose.yml
 Dockerfile
+tests/
+.pytest_cache/
+tz/
+*.zoom.json
