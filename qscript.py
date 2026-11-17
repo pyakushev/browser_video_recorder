@@ -4,8 +4,13 @@ Public API
 ----------
 PATH_TO_VIDEO_FOLDER   global: where the .webm files are written
 HEADLESS               global: run whether with window or not
+AUTO_ZOOM              global: trigger the two demo zooms in the sample scenario
+ZOOM_FACTOR            global: magnification written to the sidecar (default 2.0)
+ZOOM_RAMP_SEC          global: zoom-in/out duration written to the sidecar (0.5)
 CaptureVideo_Magento   runs the sample scenario and returns the video path
 ShowCallout            shows a text callout on the page being recorded
+ZoomAt                 toggles the zoom from the scenario (window.__zoomAt)
+zoom_sidecar_path      returns <video>.zoom.json for a recorded video
 """
 
 from __future__ import annotations
@@ -18,13 +23,16 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+
+from zoom_sidecar import ZoomEvent, ZoomSidecar, sidecar_path, write_sidecar
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +43,15 @@ PATH_TO_VIDEO_FOLDER = "./video"
 HEADLESS = True
 
 VIDEO_SIZE = {"width": 1280, "height": 720}
+
+#: Zoom settings written to the sidecar and used by apply_zoom.py.
+VIDEO_FPS = 25
+ZOOM_FACTOR = 2.0
+ZOOM_RAMP_SEC = 0.5
+
+#: Trigger two demo zooms in the sample scenario (search box + first result).
+#: The programmatic hook and F5 keep working when this is False.
+AUTO_ZOOM = True
 
 SEARCH_BOX_SELECTOR = 'textarea[name="q"]'
 SEARCH_BUTTON_SELECTOR = 'form button[type="submit"]:visible'
@@ -90,8 +107,10 @@ OVERLAY_JS = r"""
   root.appendChild(arrow);
 
   let shown = false;
+  let lastX = 0, lastY = 0;
 
   const place = (x, y) => {
+    lastX = x; lastY = y;
     hl.style.transform = "translate(" + (x - HL_R) + "px," + (y - HL_R) + "px)";
     arrow.style.transform = "translate(" + (x - 1) + "px," + (y - 1) + "px)";
     if (!shown) { hl.style.display = "block"; arrow.style.display = "block"; shown = true; }
@@ -118,6 +137,71 @@ OVERLAY_JS = r"""
     ], { duration: 700, easing: "ease-out" });
     a.onfinish = () => r.remove();
   };
+
+  // Zoom indicator: a colored ring at the trigger point and a small badge
+  // while the zoom is active. Pure decoration, never intercepts the mouse.
+  const zoomFactor = Number(window.__PW_ZOOM_FACTOR) || 2;
+  let zoomOn = false;
+  let zoomBadge = null;
+
+  const zoomState = (on) => {
+    zoomOn = !!on;
+    if (zoomOn) {
+      if (!zoomBadge) {
+        zoomBadge = document.createElement("div");
+        zoomBadge.style.cssText = "position:absolute;top:16px;right:16px;" +
+          "padding:8px 14px;border-radius:8px;background:rgba(0,0,0,0.78);" +
+          "border:2px solid #00E5FF;color:#00E5FF;font:bold 16px/1 Arial,sans-serif;" +
+          "letter-spacing:1px;pointer-events:none;";
+        root.appendChild(zoomBadge);
+      }
+      zoomBadge.textContent = "ZOOM " + zoomFactor.toFixed(1) + "\u00d7";
+      zoomBadge.style.display = "block";
+    } else if (zoomBadge) {
+      zoomBadge.style.display = "none";
+    }
+  };
+
+  const zoomRing = (x, y) => {
+    const ring = document.createElement("div");
+    const color = zoomOn ? "#00E5FF" : "#FF1744";
+    ring.style.cssText = "position:absolute;left:0;top:0;width:96px;height:96px;" +
+      "box-sizing:border-box;border:4px solid " + color + ";border-radius:50%;" +
+      "pointer-events:none;will-change:transform,opacity;";
+    const base = "translate(" + (x - 48) + "px," + (y - 48) + "px) ";
+    ring.style.transform = base + "scale(0.5)";
+    root.appendChild(ring);
+    const a = ring.animate([
+      { opacity: 0, transform: base + "scale(0.4)" },
+      { opacity: 1, offset: 0.2, transform: base + "scale(1.0)" },
+      { opacity: 0.9, offset: 0.6, transform: base + "scale(1.25)" },
+      { opacity: 0, transform: base + "scale(1.6)" }
+    ], { duration: 900, easing: "ease-out" });
+    a.onfinish = () => ring.remove();
+  };
+
+  const toggleZoom = (x, y) => {
+    const nx = (typeof x === "number" && isFinite(x)) ? x : lastX;
+    const ny = (typeof y === "number" && isFinite(y)) ? y : lastY;
+    zoomState(!zoomOn);
+    zoomRing(nx, ny);
+    if (typeof window.__zoomEvent === "function") {
+      try { window.__zoomEvent(nx, ny); } catch (e) {}
+    }
+  };
+
+  // Programmatic hook used by the automation scenario (and by tests).
+  window.__zoomAt = (x, y) => toggleZoom(x, y);
+
+  // F5 toggles the same zoom. preventDefault keeps Chromium from reloading.
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "F5" || e.keyCode === 116) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!e.repeat) toggleZoom(lastX, lastY);
+      return false;
+    }
+  }, true);
 
   // Callout: yellow box, black 16pt text, auto-sized, fade in / hold / fade out.
   const callout = (text, bg, fg, fadeMs, holdMs) => {
@@ -173,12 +257,24 @@ OVERLAY_JS = r"""
     if (s && isFinite(s.x) && isFinite(s.y)) place(s.x, s.y);
   } catch (e) {}
 
-  window.__pwOverlay = { set: set, callout: callout };
+  window.__pwOverlay = { set: set, callout: callout, zoom: zoomState };
 })();
 """
 
 _active_page: Optional[Page] = None
 _cursor: Dict[str, float] = {"x": 0.0, "y": 0.0}
+
+#: Zoom events of the current recording, in the sidecar format.
+_zoom_events: List[Dict[str, object]] = []
+_zoom_active = False
+_zoom_t0 = 0.0
+
+
+def _reset_zoom_state() -> None:
+    global _zoom_active, _zoom_t0
+    _zoom_events.clear()
+    _zoom_active = False
+    _zoom_t0 = 0.0
 
 
 def _evaluate_retry(page: Page, expression: str, arg: object = None, attempts: int = 6) -> object:
@@ -203,11 +299,68 @@ def _sync_cursor(page: Page) -> None:
     try:
         _evaluate_retry(
             page,
-            "([x, y]) => { if (window.__pwOverlay) window.__pwOverlay.set(x, y); }",
-            [_cursor["x"], _cursor["y"]],
+            "([x, y, z]) => { if (window.__pwOverlay) {"
+            " window.__pwOverlay.set(x, y);"
+            " if (window.__pwOverlay.zoom) window.__pwOverlay.zoom(z); } }",
+            [_cursor["x"], _cursor["y"], _zoom_active],
         )
     except PlaywrightError as exc:
         logger.debug("cursor sync failed: %s", exc)
+
+
+def _record_zoom_event(_source: object, x: object, y: object) -> None:
+    """Playwright binding: the page pressed F5 or called ``window.__zoomAt``."""
+    global _zoom_active
+    try:
+        fx, fy = float(x), float(y)
+    except (TypeError, ValueError):
+        return
+    if not (math.isfinite(fx) and math.isfinite(fy)):
+        return
+
+    elapsed = max(0.0, time.monotonic() - _zoom_t0) if _zoom_t0 else 0.0
+    kind = "out" if _zoom_active else "in"
+    _zoom_active = not _zoom_active
+    _zoom_events.append(
+        {"t": round(elapsed, 3), "x": round(fx, 2), "y": round(fy, 2), "type": kind}
+    )
+
+
+def ZoomAt(x: Optional[float] = None, y: Optional[float] = None) -> None:
+    """Toggle the zoom from the scenario (the automation does not press F5).
+
+    The call goes through the same ``window.__zoomAt`` hook the operator uses,
+    so the on-screen indicator and the recorded event stay identical.
+    """
+    page = _active_page
+    if page is None:
+        return
+    try:
+        if x is None and y is None:
+            _evaluate_retry(page, "() => { if (window.__zoomAt) window.__zoomAt(); }")
+        else:
+            _evaluate_retry(
+                page,
+                "([x, y]) => { if (window.__zoomAt) window.__zoomAt(x, y); }",
+                [x, y],
+            )
+        # The binding is delivered asynchronously; let Python record the event
+        # before the scenario moves on (timing accuracy of the sidecar).
+        page.wait_for_timeout(60)
+    except PlaywrightError as exc:
+        logger.warning("zoom toggle failed: %s", exc)
+
+
+def _auto_zoom(page: Page, x: float, y: float, hold_sec: float) -> None:
+    """Demo helper: zoom in, hold, zoom out around a point."""
+    if not AUTO_ZOOM or hold_sec <= 0:
+        return
+    ZoomAt(x, y)
+    page.wait_for_timeout(int(hold_sec * 1000))
+    ZoomAt(x, y)
+    # Let the zoom-out ramp finish before the caller clicks: a click can
+    # navigate immediately and replace the page with a blank/loader frame.
+    page.wait_for_timeout(int(max(0.0, ZOOM_RAMP_SEC) * 1000) + 150)
 
 
 def ShowCallout(
@@ -271,8 +424,14 @@ def _target_point(box: Dict[str, float], aim: str) -> Tuple[float, float]:
     )
 
 
-def _click_element(page: Page, locator: Locator, aim: str = "center") -> None:
-    """Glide to the element and click it with the real mouse."""
+def _click_element(
+    page: Page, locator: Locator, aim: str = "center", zoom_hold: float = 0.0
+) -> None:
+    """Glide to the element and click it with the real mouse.
+
+    ``zoom_hold`` > 0 adds a demo zoom-in/hold/zoom-out around the click point
+    before the click itself.
+    """
     locator.wait_for(state="visible", timeout=ELEMENT_TIMEOUT_MS)
     locator.scroll_into_view_if_needed(timeout=ELEMENT_TIMEOUT_MS)
     box = locator.bounding_box()
@@ -281,6 +440,8 @@ def _click_element(page: Page, locator: Locator, aim: str = "center") -> None:
     tx, ty = _target_point(box, aim)
     _glide_to(page, tx, ty)
     page.wait_for_timeout(random.uniform(180, 380))
+    if zoom_hold > 0:
+        _auto_zoom(page, tx, ty, zoom_hold)
     page.mouse.click(tx, ty, delay=random.uniform(60, 110))
 
 
@@ -342,7 +503,7 @@ def _run_scenario(page: Page, url: str, city: str) -> None:
     query = (f"Magento developer in {city}") if city else "Magento developer"
     ShowCallout(f"Searching for: {query}")
 
-    _click_element(page, search_box)
+    _click_element(page, search_box, zoom_hold=1.0)
 
     page.wait_for_timeout(300)
     _type_humanlike(page, query)
@@ -366,7 +527,7 @@ def _run_scenario(page: Page, url: str, city: str) -> None:
     # Keep a single tab (and therefore a single video file).
     link.evaluate("el => el.removeAttribute('target')")
     results_url = page.url
-    _click_element(page, link, aim="start")
+    _click_element(page, link, aim="start", zoom_hold=1.0)
 
     def left_results(u: str) -> bool:
         return u != results_url
@@ -380,6 +541,40 @@ def _run_scenario(page: Page, url: str, city: str) -> None:
 
     _sync_cursor(page)
     page.wait_for_timeout(FINAL_HOLD_MS)
+
+
+def zoom_sidecar_path(video_path: Union[str, Path]) -> str:
+    """Public helper: where the sidecar for ``video_path`` lives."""
+    return str(sidecar_path(video_path))
+
+
+def _write_zoom_sidecar(video_path: Path) -> Optional[Path]:
+    """Write ``<video>.zoom.json`` when at least one zoom was triggered.
+
+    A stale sidecar from a previous recording is removed when there are no
+    events, so an old zoom is never applied to a new video.
+    """
+    target = sidecar_path(video_path)
+    if not _zoom_events:
+        target.unlink(missing_ok=True)
+        return None
+
+    sidecar = ZoomSidecar(
+        events=tuple(
+            ZoomEvent(
+                t=float(event["t"]),
+                x=float(event["x"]),
+                y=float(event["y"]),
+                type=str(event["type"]),
+            )
+            for event in _zoom_events
+        ),
+        viewport=(float(VIDEO_SIZE["width"]), float(VIDEO_SIZE["height"])),
+        fps=float(VIDEO_FPS),
+        zoom_factor=float(ZOOM_FACTOR),
+        ramp_sec=float(ZOOM_RAMP_SEC),
+    )
+    return write_sidecar(target, sidecar)
 
 
 def CaptureVideo_Magento(
@@ -398,8 +593,9 @@ def CaptureVideo_Magento(
     and ``house_no`` are accepted for the common interface but unused by this
     sample behavior; ``city`` goes into the query, ``company_name`` names the file.
     """
-    global _active_page
+    global _active_page, _zoom_t0
 
+    _reset_zoom_state()
     try:
         video_dir = Path(PATH_TO_VIDEO_FOLDER).expanduser().resolve()
         video_dir.mkdir(parents=True, exist_ok=True)
@@ -427,8 +623,13 @@ def CaptureVideo_Magento(
                     user_agent=_user_agent(browser.version),
                     locale="en-US",
                 )
-                context.add_init_script(OVERLAY_JS)
+                context.add_init_script(
+                    "window.__PW_ZOOM_FACTOR = %r;\n" % float(ZOOM_FACTOR) + OVERLAY_JS
+                )
                 page = context.new_page()
+                # The video starts with the page: this is t=0 for the sidecar.
+                _zoom_t0 = time.monotonic()
+                page.expose_binding("__zoomEvent", _record_zoom_event)
                 video = page.video
                 _cursor["x"], _cursor["y"] = 0.0, 0.0
                 _active_page = page
@@ -444,6 +645,13 @@ def CaptureVideo_Magento(
                     raw_path = Path(video.path())
                     final_path = video_dir / (_safe_filename(company_name) + ".webm")
                     os.replace(str(raw_path), str(final_path))
+                    try:
+                        sidecar = _write_zoom_sidecar(final_path)
+                    except OSError as exc:  # the video is still valid without a sidecar
+                        logger.warning("cannot write zoom sidecar for %s: %s", final_path, exc)
+                    else:
+                        if sidecar is not None:
+                            logger.info("zoom sidecar: %s", sidecar)
             finally:
                 browser.close()
     except Exception as exc:  # noqa: BLE001 - the contract is "path or None"
