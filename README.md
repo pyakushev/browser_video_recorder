@@ -355,6 +355,24 @@ RUN_DOCKER_TESTS=1 pytest -m docker           # full Docker stack (builds an iso
   `18081` (CSV import, re-import guarantees, enrichment in `ENRICH_MOCK=1` mode against a fixture
   website, statuses 0/5/1, token-log). Both are opt-in and tear down their volumes afterwards.
 
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `master`, on pull
+requests and on demand:
+
+| Job | What it does |
+|---|---|
+| `Unit tests` (Python 3.9 and 3.12) | `pip install -r requirements-web.txt pytest`, then `pytest -m "not integration and not docker"` |
+| `Zoom post-processing (ffmpeg)` | installs ffmpeg, runs `tests/test_apply_zoom_integration.py` |
+
+Python 3.9 is the minimum the task requires, 3.12 is the version of the Docker image. The
+Playwright-based tests skip themselves when Playwright is not installed (the CI unit job keeps
+CI fast and deterministic); the Docker end-to-end tests stay opt-in (`RUN_DOCKER_TESTS=1`)
+because they need a Docker daemon.
+
+`requirements-dev.txt` marks Playwright with an environment marker
+(`; python_version < "3.15"`) so a newer local interpreter can still install the rest.
+
 ## Design notes
 
 - **FastAPI/uvicorn instead of Apache/mod_wsgi.** The web service from Internship Task 1 is an ASGI

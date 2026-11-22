@@ -2,8 +2,12 @@
 
 from pathlib import Path
 
-import qscript
-from zoom_sidecar import load_sidecar
+import pytest
+
+pytest.importorskip("playwright.sync_api")
+
+import qscript  # noqa: E402  (imports Playwright)
+from zoom_sidecar import load_sidecar  # noqa: E402
 
 
 def test_no_events_does_not_write_and_removes_a_stale_sidecar(tmp_path):

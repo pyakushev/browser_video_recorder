@@ -1,5 +1,7 @@
 -r requirements-web.txt
-playwright==1.64.0
+# Playwright is only needed for the recorder (capture_video.py) and the
+# capture integration test, not for the service/enricher or the CI unit run.
+playwright==1.64.0 ; python_version < "3.15"
 requests>=2.31
 pytest>=8
 pytest-cov>=5
