@@ -16,7 +16,9 @@ concurrency:
 jobs:
   tests:
     name: Unit tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+
+    # For python 3.9 support
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -52,7 +54,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-web.txt
 
