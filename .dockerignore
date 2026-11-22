@@ -18,3 +18,4 @@ tests/
 .pytest_cache/
 tz/
 *.zoom.json
+companies.csv

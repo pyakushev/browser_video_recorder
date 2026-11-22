@@ -3,3 +3,5 @@ requests>=2.31
 fastapi>=0.115
 uvicorn>=0.30
 python-multipart>=0.0.18
+beautifulsoup4>=4.12
+lxml>=5

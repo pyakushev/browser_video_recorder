@@ -13,6 +13,13 @@ services:
       DB_USER: ${DB_USER:-video_user}
       DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
       MAX_SIDECAR_KB: ${MAX_SIDECAR_KB:-2048}
+      MAX_COMPANIES_CSV_KB: ${MAX_COMPANIES_CSV_KB:-5120}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - uploads:/app/uploads
     depends_on:
@@ -47,12 +54,42 @@ services:
       ZOOM_TIMEOUT_SEC: ${ZOOM_TIMEOUT_SEC:-1800}
       ZOOM_MAX_ATTEMPTS: ${ZOOM_MAX_ATTEMPTS:-3}
       WORKER_STALE_SEC: ${WORKER_STALE_SEC:-1800}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - uploads:/app/uploads
     depends_on:
       db:
         condition: service_healthy
     stop_grace_period: 60s
+
+  enricher:
+    image: playwright-zoom-service:local
+    profiles: ["tools"]
+    entrypoint: ["python", "enrich_companies.py"]
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-videos}
+      DB_USER: ${DB_USER:-video_user}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (cp .env.example .env)}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-20}
+      HTTP_DELAY_SEC: ${HTTP_DELAY_SEC:-0.5}
+      ENRICH_MOCK: ${ENRICH_MOCK:-0}
+    env_file:
+      - path: .env
+        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
 
   db:
     image: postgres:16
