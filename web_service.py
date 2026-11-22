@@ -52,10 +52,12 @@ from urllib.parse import quote
 
 import psycopg2
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
+import companies as company_data
 from zoom_sidecar import SidecarError, ZoomSidecar, loads_sidecar, sidecar_path, write_sidecar
 
 logger = logging.getLogger("uvicorn.error")  # -> `docker compose logs web`
@@ -63,10 +65,13 @@ logger = logging.getLogger("uvicorn.error")  # -> `docker compose logs web`
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(BASE_DIR / "uploads"))).resolve()
 TMP_DIR = UPLOAD_DIR / ".tmp"  # partial uploads, same volume (atomic rename); never served
+TEMPLATES_DIR = BASE_DIR / "templates"
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "500")) * 1024 * 1024
 MAX_SIDECAR_BYTES = int(os.environ.get("MAX_SIDECAR_KB", "2048")) * 1024
 CHUNK_SIZE = 1024 * 1024
+MAX_COMPANIES_CSV_BYTES = int(os.environ.get("MAX_COMPANIES_CSV_KB", "5120")) * 1024
 
 POOL_MAX = int(os.environ.get("DB_POOL_MAX", "10"))
 CONNECT_RETRIES = int(os.environ.get("DB_CONNECT_RETRIES", "30"))
@@ -227,8 +232,11 @@ def db_connection() -> Iterator[Any]:
             pool.putconn(conn)
 
 
+COMPANIES_SCHEMA = company_data.load_schema_sql()
+
+
 def init_db() -> None:
-    """Create the upload folders and the `videos` table (idempotent)."""
+    """Create the folders, the `videos` table and the `companies` table (idempotent)."""
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     with db_connection() as conn, conn.cursor() as cur:
@@ -237,6 +245,7 @@ def init_db() -> None:
         cur.execute(SCHEMA)
         cur.execute(MIGRATIONS)
         cur.execute(JOBS_SCHEMA)
+        cur.execute(COMPANIES_SCHEMA)
 
 
 def safe_stem(company_name: str) -> str:
@@ -351,7 +360,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     close_pool()
 
 
-app = FastAPI(title="Video upload service", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="Video upload service", version="3.0.0", lifespan=lifespan)
 
 
 @app.post("/upload")
@@ -610,6 +619,97 @@ def process_job(job_id: int) -> Dict[str, Any]:
             (job["video_id"],),
         )
     return {"job_id": job_id, "video_id": job["video_id"], "status": "pending"}
+
+
+def _companies_stats(cur: Any) -> Dict[str, int]:
+    cur.execute(
+        "SELECT count(*) AS total, count(*) FILTER (WHERE status IS NULL) AS pending, "
+        "count(*) FILTER (WHERE status = 0) AS ok, count(*) FILTER (WHERE status = 4) AS errors "
+        "FROM companies"
+    )
+    return dict(cur.fetchone())
+
+
+def _render_upload_form(
+    request: Request, result: Optional[Dict[str, Any]] = None, error: Optional[str] = None
+) -> HTMLResponse:
+    with db_connection() as conn, conn.cursor() as cur:
+        stats = _companies_stats(cur)
+    return templates.TemplateResponse(
+        request,
+        "upload_companies.html",
+        {
+            "stats": stats,
+            "result": {"imported": None, "message": error} if error else result,
+            "max_mb": MAX_COMPANIES_CSV_BYTES // (1024 * 1024),
+        },
+    )
+
+
+@app.get("/upload_companies", response_class=HTMLResponse)
+def upload_companies_form(request: Request) -> HTMLResponse:
+    """Tiny HTML form that posts a companies CSV to POST /upload_companies."""
+    return _render_upload_form(request)
+
+
+def _import_companies_csv(raw: bytes) -> Dict[str, int]:
+    if len(raw) > MAX_COMPANIES_CSV_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"CSV is larger than {MAX_COMPANIES_CSV_BYTES // (1024 * 1024)} MB",
+        )
+    try:
+        rows = company_data.parse_companies_csv(raw)
+    except company_data.CompaniesError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with db_connection() as conn, conn.cursor() as cur:
+        imported, updated = company_data.upsert_companies(cur, rows)
+    logger.info("companies import: %d new, %d updated, %d rows", imported, updated, len(rows))
+    return {"imported": imported, "updated": updated, "total_rows": len(rows)}
+
+
+@app.post("/upload_companies")
+def upload_companies(
+    request: Request, file: UploadFile = File(...), redirect: bool = False
+):
+    """Import a companies CSV; CSV columns are upserted, enrichment is preserved.
+
+    JSON by default; with ``?redirect=1`` (the HTML form) the page is rendered
+    again with the result instead of raw JSON.
+    """
+    raw = file.file.read(MAX_COMPANIES_CSV_BYTES + 1)
+    if not redirect:
+        return _import_companies_csv(raw)
+    try:
+        result = _import_companies_csv(raw)
+    except HTTPException as exc:
+        return _render_upload_form(request, error=f"Import failed: {exc.detail}")
+    message = (
+        f"Imported {result['imported']} new and updated {result['updated']} "
+        f"of {result['total_rows']} row(s)."
+    )
+    return _render_upload_form(request, result={**result, "message": message})
+
+
+@app.get("/companies")
+def list_companies(status: Optional[str] = Query(None)) -> List[Dict[str, Any]]:
+    """All companies (optionally ?status=N / ?status=ok / ?status=pending)."""
+    with db_connection() as conn, conn.cursor() as cur:
+        try:
+            return company_data.select_companies(cur, status)
+        except company_data.CompaniesError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/companies/{company_name}")
+def get_company(company_name: str) -> Dict[str, Any]:
+    """One company with imported and extracted data (404 if unknown)."""
+    with db_connection() as conn, conn.cursor() as cur:
+        row = company_data.select_company(cur, company_name)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"no company {company_name!r}")
+    return row
 
 
 @app.get("/health")

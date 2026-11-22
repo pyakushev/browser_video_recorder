@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Import companies</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+           margin: 0; background: #f6f7f9; color: #1f2430; }
+    main { max-width: 640px; margin: 64px auto; padding: 0 24px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    p.hint { color: #5b6472; margin: 0 0 24px; font-size: 14px; }
+    .card { background: #fff; border: 1px solid #e3e6eb; border-radius: 10px;
+            padding: 24px; box-shadow: 0 1px 2px rgba(16, 24, 40, .04); }
+    label { display: block; font-weight: 600; margin-bottom: 8px; font-size: 14px; }
+    input[type=file] { display: block; width: 100%; box-sizing: border-box;
+                       border: 1px dashed #c3c9d4; border-radius: 8px;
+                       padding: 14px; background: #fafbfc; font-size: 14px; }
+    button { margin-top: 18px; background: #2563eb; color: #fff; border: 0;
+             border-radius: 8px; padding: 10px 18px; font-size: 14px;
+             font-weight: 600; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    a { color: #2563eb; }
+    .stats { margin-top: 18px; font-size: 13px; color: #5b6472; }
+    .result { margin-bottom: 20px; border-left: 4px solid #2563eb; }
+    code { background: #f1f3f6; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    {% if result %}
+    <div class="card result">
+      <strong>{{ result.message }}</strong>
+      {% if result.imported is not none %}
+      <div class="stats">Imported {{ result.imported }}, updated {{ result.updated }},
+        {{ result.total_rows }} row(s) in the file &middot;
+        <a href="/companies">open the JSON list</a></div>
+      {% endif %}
+    </div>
+    {% endif %}
+    <h1>Import companies</h1>
+    <p class="hint">Upload a CSV (UTF-8, <code>;</code> delimiter, <code>"</code> qualifier)
+      with the columns <code>URL;Company Name;Language;Country;Postcode;City;Street;HouseNo;Web</code>.
+      Re-importing updates the CSV fields and keeps already extracted Impressum data.</p>
+
+    <form class="card" method="post" action="/upload_companies" enctype="multipart/form-data">
+      <label for="file">Companies CSV</label>
+      <input id="file" name="file" type="file" accept=".csv,text/csv" required>
+      <button type="submit" formaction="/upload_companies?redirect=1">Import</button>
+      <div class="stats">
+        {{ stats.total }} company/companies stored,
+        {{ stats.pending }} not yet enriched &middot;
+        <a href="/companies">open the JSON list</a> &middot; max {{ max_mb }} MB
+      </div>
+    </form>
+  </main>
+</body>
+</html>

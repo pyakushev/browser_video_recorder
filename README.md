@@ -1,4 +1,4 @@
-# Browser video recorder + zoom post-processing + video web service (Docker)
+# Browser video recorder + zoom post-processing + company Impressum enrichment (Docker)
 
 Three parts that work together:
 
@@ -67,8 +67,9 @@ uses it to build the `processed_video_url` stored in PostgreSQL.
 | `worker` | the same image (`playwright-zoom-service:local`) | `python -m zoom_worker`, no published port, volume `uploads:/app/uploads`, `init: true`, `stop_grace_period: 60s` |
 | `db` | `postgres:16` | volume `db_data:/var/lib/postgresql/data`, **no published ports** (reachable only from `web`/`worker`) |
 
-`docker compose up --build` builds the image through the `web` service; `worker` reuses the same
-`playwright-zoom-service:local` tag, so ffmpeg is installed in exactly one image.
+`docker compose up --build` builds the image through the `web` service; `worker` and the one-off
+`enricher` (`--profile tools`) reuse the same `playwright-zoom-service:local` tag, so ffmpeg and the
+Python dependencies are installed in exactly one image.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -81,6 +82,8 @@ uses it to build the `processed_video_url` stored in PostgreSQL.
 | `MAX_UPLOAD_MB` | `500` | upload size limit |
 | `MAX_SIDECAR_KB` | `2048` | zoom sidecar size limit |
 | `WEB_PORT` | `8000` | host port published by compose |
+| `MAX_COMPANIES_CSV_KB` | `5120` | companies CSV size limit |
+| `DEEPSEEK_*`, `ENRICH_MOCK`, `HTTP_*` | see below | enrichment (Task 3) |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | public base URL used by the worker for `processed_video_url` |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg binary used by the worker |
 | `WORKER_POLL_SEC` | `1` | idle polling interval |
@@ -165,6 +168,130 @@ python apply_zoom.py --video video/ACME_GmbH.webm --ffmpeg /usr/bin/ffmpeg
 Legacy sidecars without `type` are accepted: events alternate `in`/`out` in order, starting with
 `in`.
 
+## Company import and Impressum enrichment
+
+A CSV with company data is imported into PostgreSQL through a small web form; a standalone
+program then opens each company's website, finds its Impressum/Imprint page and asks DeepSeek for
+the legally required data as JSON, pruning the page text first so the request stays small.
+
+```bash
+cp env.example .env                 # DB_PASSWORD + DEEPSEEK_API_KEY
+docker compose up --build
+
+# import: browser form at http://localhost:8000/upload_companies,
+#         or curl with the sample file companies.csv
+curl -F "file=@companies.csv" http://localhost:8000/upload_companies
+curl http://localhost:8000/companies
+curl "http://localhost:8000/companies?status=1"
+
+# enrich (one-off container, profile "tools")
+docker compose run --rm enricher                                   # pending + non-OK rows
+docker compose run --rm enricher --company "ACME GmbH" --limit 1
+docker compose run --rm enricher --status 1 --dry-run              # no database writes
+```
+
+On the host (without Docker): `python enrich_companies.py --company "ACME GmbH"` after
+`pip install -r requirements.txt` and a reachable PostgreSQL.
+
+### CSV format
+
+UTF-8, `;` delimiter, `"` qualifier — the recorder format plus the new `Web` column
+(see [`companies.csv`](companies.csv)):
+
+```
+URL;Company Name;Language;Country;Postcode;City;Street;HouseNo;Web
+https://duckduckgo.com;ACME GmbH;German;Germany;10115;Berlin;Main Street;12;https://www.acme-gmbh.de
+```
+
+`Company Name` is the unique key. `Web` may omit the scheme (`www.acme.de`) and may be blank (the
+company is imported and later marked `NO_WEBSITE`). A CSV without the `Web` header is accepted and
+means "no website" for every row.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/upload_companies` | HTML form for the CSV upload (plus a link to `/companies`) |
+| POST | `/upload_companies` | multipart `file`; upsert by `company_name`; returns `{"imported", "updated", "total_rows"}` |
+| GET | `/companies` | all rows as JSON; `?status=N`, `?status=ok`, `?status=pending` filter |
+| GET | `/companies/<company_name>` | one row (imported + extracted fields), `404` if unknown |
+
+A re-import only updates the CSV columns (`language`, `country`, `postcode`, `city`, `street`,
+`house_no`, `web`); `status` and all extracted fields are left untouched, so enrichment results
+survive re-imports.
+
+### `companies` table and status codes
+
+Created idempotently from [`schema.sql`](schema.sql) on first use (both the web service and the
+enricher do it). The status is an integer, `NULL` meaning "imported, not processed yet":
+
+| Value | Name | Meaning |
+|---|---|---|
+| `NULL` | (pending) | imported, not yet enriched |
+| 0 | `OK` | Impressum parsed **and** `postcode`/`city`/`street`/`house_no` all filled |
+| 1 | `NO_IMPRESSUM_LINK_FOUND` | home page has no Impressum/Imprint link |
+| 2 | `PARSING_FAILED` | no field detected (empty JSON answer or empty page) |
+| 3 | `ADDRESS_INCOMPLETE` | fields detected, but the address is incomplete |
+| 4 | `ERROR` | network/HTTP/DeepSeek failure — the batch continues |
+| 5 | `NO_WEBSITE` | the `web` column is empty or not a web URL |
+
+Missing VAT/phone/person never downgrades an otherwise OK result.
+
+### How the enricher works
+
+For each selected company (by id; `--status` defaults to pending + non-OK rows, `--limit`,
+`--company`):
+
+1. Normalize `web` (`www.x.de` → `https://www.x.de`); empty → `5`.
+2. GET the home page, find `<a>` whose text is exactly `impressum`/`imprint`, else an `<a>` whose
+   `href` contains it; resolve relative links with `urljoin`; nothing → `1`.
+3. GET the Impressum page; BeautifulSoup removes `script/style/noscript/svg/nav/header/footer/form`
+   and returns the visible text (never HTML); errors → `4`. The resolved URL is stored.
+4. Prune the text to a token budget (below) and log `chars before → after` and the estimated tokens.
+5. Ask DeepSeek (`response_format={"type":"json_object"}`, `temperature 0`, JSON retries with
+   backoff) and map the answer into the columns; `raw_json` keeps the whole object.
+6. Decide the status per §4.6 and write everything back, even on failure (status 4 keeps
+   `impressum_url` for traceability).
+
+### Token optimization
+
+`MAX_TEXT_CHARS = 8000` (≈ 2000 tokens at `tokens ≈ chars / 4`); shorter texts are sent unchanged.
+Longer ones go through [`impressum.py`](impressum.py):
+
+1. **Boilerplate lines** are dropped: cookie banners, Datenschutz/AGB/menu entries, `© 2024`,
+   language switchers, "Zurück nach oben", repeated feature blocks and single filler paragraphs
+   longer than 600 characters that contain no legal datum.
+2. **Head anchor** — the legal section starts at "Angaben gemäß § 5 TMG/DDG", "Diensteanbieter",
+   then "Anbieter"/"Impressum" (strong anchors win, so a menu item "Impressum" at the very top does
+   not move the cut into the navigation). Everything before it is the menu/hero and is cut.
+3. **Tail anchors** — the last legally required datum marks the end of the legal block: phone
+   `+49`/`0049`, VAT `DE` + 9 digits, e-mail, `HRB`/`HRA`/Registergericht/Amtsgericht,
+   "Vertreten durch"/Geschäftsführer/"Inhaltlich verantwortlich". `400` characters after it are kept
+   as context, the footer is cut.
+4. **Sandwich + growing margin** — if the cut is still over the budget, the tail margin grows
+   (×1.5, up to `min(4000, budget)`), which covers "Details", "Preise", contact forms after the
+   legal data.
+5. **Verification** — the result must still contain the head anchor and at least one strong signal;
+   otherwise the largest verified block around the strongest signal is used, then a bounded window.
+   A final cap guarantees that no request ever exceeds the budget even for pathological pages.
+
+The per-company log line is e.g. `chars 12488 -> 187 (tokens ~3122 -> ~46, saved 99%);
+cutoff=sandwich; anchors=email, handelsregister, phone, responsible, vat`.
+
+### DeepSeek configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | **required** | provided by the instructor; kept in `.env` (git-ignored) or the environment |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | model alias |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible base URL |
+| `DEEPSEEK_MAX_TOKENS`, `DEEPSEEK_TIMEOUT`, `DEEPSEEK_RETRIES` | `1024`, `60`, `3` | answer budget and retry policy |
+| `HTTP_TIMEOUT`, `HTTP_DELAY_SEC`, `HTTP_USER_AGENT` | `20`, `0.5`, browser UA | polite crawling of company sites |
+| `ENRICH_MOCK` | `0` | `1` uses a deterministic fake answer — offline demo/CI only, no key needed |
+
+The key is never hard-coded, never logged and never baked into the image (compose passes it at
+runtime only).
+
 ## API
 
 | Method | Path | Purpose |
@@ -216,13 +343,17 @@ RUN_DOCKER_TESTS=1 pytest -m docker           # full Docker stack (builds an iso
 - Unit tests cover the zoom-filter generation, coordinate mapping/clamping, ramp frame math,
   multiple pairs, open-ended zooms, sidecar parsing, legacy sidecars without `type`, and the
   "no events → copy unchanged" path.
+- Enrichment tests cover CSV parsing/upsert helpers, the `companies` endpoints, URL/link discovery,
+  visible-text extraction, the pruning pipeline (head/tail anchors, growing margin, fallbacks,
+  before/after counts), the DeepSeek client (mocked: retries, blank answers, auth errors) and the
+  enrichment pipeline (all status codes, persistence, batch continuation).
 - The ffmpeg integration test generates a `testsrc` clip, applies the zoom and checks the output
   resolution/duration; it is skipped if ffmpeg is not installed.
 - The Playwright test checks `window.__zoomAt`, F5, the on-screen ring and sidecar writing; it is
   skipped if the Chromium browser is not installed.
-- The Docker test builds an isolated project on port `18080`, uploads a video + sidecar, waits for
-  the worker, checks the processed URL (HTTP 200), the PostgreSQL row and that the worker image has
-  `ffmpeg`. It is opt-in and tears down its volumes afterwards.
+- The Docker tests build isolated projects: one on port `18080` (video + zoom worker) and one on
+  `18081` (CSV import, re-import guarantees, enrichment in `ENRICH_MOCK=1` mode against a fixture
+  website, statuses 0/5/1, token-log). Both are opt-in and tear down their volumes afterwards.
 
 ## Design notes
 
@@ -253,3 +384,7 @@ RUN_DOCKER_TESTS=1 pytest -m docker           # full Docker stack (builds an iso
 | processed URL points to the wrong host | set `PUBLIC_BASE_URL` to the public address (and keep `WEB_PORT` in sync) |
 | `apply_zoom.py --dry-run` says "no zoom events" | `<video>.zoom.json` is missing or its `events` list is empty; a copy is intentional |
 | VP9 encoding is slow | raise `--cpu-used` (0–8) or `--crf` to trade quality for speed, or run more workers |
+| `DEEPSEEK_API_KEY is not set` | put the key into `.env` next to `compose.yml`, or export it; `docker compose config` should show it under `enricher` |
+| a company ends as `4 (ERROR)` | `docker compose run --rm enricher --company "<name>"` and read the HTTP/API message; the `impressum_url` already found is kept |
+| the enrichment seems to send the whole page | check the per-company `chars ... -> ...` line; if it says "under threshold", the page is simply short |
+| status `1` although the site has an Impressum | the link is probably rendered by JavaScript or named differently; the task's fallback is exact text or href matching |
